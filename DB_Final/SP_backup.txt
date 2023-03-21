@@ -1,0 +1,538 @@
+//MySQL DB SP
+
+//第一題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_GetFollowedProposalsByMember`(
+	IN inMemberID int,
+    OUT outRowFound	int
+)
+BEGIN
+	SELECT tb_followingrecord.MemberID as member_id,
+			tb_proposal.ProposalID as proposal_id,
+			tb_proposal.ProposalTitle as proposal_title,
+			tb_proposal.AccumulatedAmount as proposal_amount,
+			tb_proposal.Goal as proposal_goal
+	FROM tb_followingrecord
+	INNER JOIN tb_proposal ON tb_followingrecord.ProposalID = tb_proposal.ProposalID
+	WHERE tb_followingrecord.MemberID = inMemberID
+    AND tb_followingrecord.IsDeleted = 0;  -- 該追蹤紀錄尚未被使用者刪除
+    
+    SELECT found_rows() INTO outRowFound;
+END
+
+
+//第二題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_RegisterMember`(
+	IN inEmail varchar(64), 
+    IN inHashedPwd varchar(200), 
+    IN inSalt char(64), 
+    IN inName varchar(64), 
+    IN inAddress varchar(255), 
+    IN inPhone varchar(64),
+    OUT outAffectedRowNum int,
+    OUT outMessage TEXT
+)
+BEGIN
+	-- 資料出錯時可以rollback
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+	BEGIN
+	ROLLBACK;
+	SELECT 'An error has occurred, operation rollbacked and the stored procedure was terminated' INTO outMessage;
+    SELECT 0 INTO outAffectedRowNum;
+	END;
+
+	-- 確定沒有已存在的member account (email)
+    IF NOT EXISTS( 
+        SELECT Email
+        FROM tb_member
+		WHERE Email = inEmail
+	) THEN 
+		-- 開始創建
+		START TRANSACTION;
+			-- 創建member
+			INSERT INTO tb_member (Name, Phone, Email, Salt, Address)
+				VALUES(inName, inPhone, inEmail, inSalt, inAddress);
+			-- 輸出前語法影響列數
+            SELECT row_count() INTO outAffectedRowNum;
+            -- 將創建的memberID存入變數
+			SELECT LAST_INSERT_ID() INTO @var_tempmemberID;
+            -- 創建membercredential資料
+			INSERT INTO tb_membercredential (MemberID, HashedPassword)
+				VALUES(@var_tempmemberID, inHashedPwd);
+			-- 輸出前語法影響列數
+            SELECT outAffectedRowNum + row_count() INTO outAffectedRowNum;
+		-- 創建完成
+        COMMIT WORK;
+        -- 更改成功訊息
+		SELECT 'Create Proposal success' INTO outMessage;
+		-- 最終table輸出
+		SELECT tb_member.MemberID as member_id,
+				tb_member.Name as name,
+				tb_member.Email as email,
+				tb_membercredential.HashedPassword as password,
+				tb_member.Salt as salt,
+				tb_member.Phone as phone,
+				tb_member.Address as address
+		FROM tb_member
+		INNER JOIN tb_membercredential ON tb_member.MemberID = tb_membercredential.MemberID
+		WHERE tb_member.MemberID = @var_tempmemberID;
+	ELSE 
+		SELECT 'The account already exist' INTO outMessage;
+        SELECT 0 INTO outAffectedRowNum;
+    END IF;
+
+END
+
+//第三題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_UpdatePwd`(
+    IN inMemberID int,
+    IN inHashedPwd varchar(200), 
+    IN inSalt char(64), 
+    OUT outAffectedRowNum int,
+    OUT outMessage TEXT
+)
+BEGIN
+	-- 資料出錯時可以rollback
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+	BEGIN
+	ROLLBACK;
+	SELECT 'An error has occurred, operation rollbacked and the stored procedure was terminated' INTO outMessage;
+    SELECT 0 INTO outAffectedRowNum;
+	END;
+    
+    -- 確認member_id存在
+	IF EXISTS( 
+        SELECT MemberID
+        FROM tb_member
+		WHERE MemberID = inMemberID
+	) THEN
+		-- 確認新輸入的salt和hashedpwd是否與原本的不同
+        IF NOT EXISTS (
+		    SELECT tb_member.MemberID
+            FROM tb_member
+            INNER JOIN tb_membercredential
+		    ON tb_member.MemberID = tb_membercredential.MemberID
+		    WHERE tb_member.Salt = inSalt OR tb_membercredential.HashedPassword = inHashedPwd
+		) THEN
+			-- 開始更新
+            START TRANSACTION;
+				UPDATE tb_member, tb_membercredential
+				SET tb_member.Salt = inSalt,
+					tb_membercredential.HashedPassword = inHashedPwd
+				WHERE
+					tb_member.MemberID = tb_membercredential.MemberID
+					AND tb_member.MemberID = inMemberID;
+				-- 輸出前語法影響列數
+				SELECT row_count() INTO outAffectedRowNum;
+			-- 更新完成
+			COMMIT WORK;
+			-- 更改成功訊息
+			SELECT 'Update Password success' INTO outMessage;
+			-- 最終table輸出
+			SELECT tb_member.MemberID as member_id,
+					tb_member.Name as name,
+					tb_member.Email as email,
+					tb_membercredential.HashedPassword as password,
+					tb_member.Salt as salt,
+					tb_member.Phone as phone,
+					tb_member.Address as address
+			FROM tb_member
+			INNER JOIN tb_membercredential ON tb_member.MemberID = tb_membercredential.MemberID
+			WHERE tb_member.MemberID = inMemberID;
+		ELSE
+			SELECT 'Password or salt no changes detected' INTO outMessage;
+            SELECT 0 INTO outAffectedRowNum;
+		END IF;
+	ELSE
+		SELECT 'The member does not exist' INTO outMessage;
+        SELECT 0 INTO outAffectedRowNum;
+	END IF;
+
+END
+
+//第四題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_Login`(
+	IN inEmail varchar(64), 
+    IN inHashedpwd varchar(200),
+    OUT status_code int
+)
+BEGIN
+    -- 宣告變數
+	DECLARE dbHashedPwd varchar(200);
+    
+	-- 先確認帳號是否存在
+	IF EXISTS (
+		SELECT Email
+		FROM tb_member
+		INNER JOIN tb_membercredential ON tb_member.MemberID = tb_membercredential.MemberID
+		WHERE tb_member.Email = inEmail
+	)THEN
+		-- 若帳號有存在，將資料庫對應此帳號的密碼存進變數
+		SELECT HashedPassword INTO dbHashedPwd
+		FROM tb_member
+		INNER JOIN tb_membercredential ON tb_member.MemberID = tb_membercredential.MemberID
+		WHERE tb_member.Email = inEmail;
+    
+		-- 接著確認使用者輸入之密碼是否正確
+        -- 登入成功
+		IF dbHashedPwd = inHashedpwd THEN 
+			SELECT 1 INTO status_code;
+		-- 登入失敗(密碼有誤)
+		ELSE
+			SELECT 2 INTO status_code;
+		END IF;
+	ELSE
+		-- 登入失敗(查無帳號)
+		SELECT 3 INTO status_code;
+	END IF;
+
+END
+
+//第五題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_GetProposalsByKeyword`(
+	IN inKeyword varchar(64),
+    OUT outRowFound	int
+)
+BEGIN
+	-- 以使用者輸入的關鍵字模糊查詢Proposals
+    SELECT ProposalID as proposal_id,
+			ProposalTitle as proposal_title,
+            DueTime as due_date,
+			AccumulatedAmount as proposal_amount
+    FROM tb_proposal
+    WHERE ProposalTitle LIKE concat('%', inKeyword, '%');
+
+    -- 輸出總共找到的列數
+    SELECT found_rows() INTO outRowFound;
+END
+
+//第六題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_UpdateProposalStatus`(
+	IN inProposalID int, 
+    IN inStatus int,
+    OUT outAffectedRowNum int
+)
+BEGIN
+	-- 宣告變數
+    DECLARE CurrentStatus int;
+
+    -- 將proposal現在的status放入變數CurrentStatus
+    SELECT Status 
+    INTO CurrentStatus
+    FROM tb_proposal
+    WHERE ProposalID = inProposalID;
+
+    -- Status只能按順序更新
+    -- 更新只有由1變2，或者是2變3，共兩種可能
+    -- 若更新為status 2 則需加入ongoingdate與duedate
+    IF inStatus = 2 AND CurrentStatus = 1 THEN
+        UPDATE tb_proposal
+        SET Status = inStatus, 
+			OnGoingTime = CURRENT_TIMESTAMP(), 
+			DueTime = DATE_ADD(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
+        WHERE ProposalID = inProposalID;
+        
+		-- 輸出影響列數
+        SELECT row_count() INTO outAffectedRowNum;
+        
+        -- 印出結果
+        SELECT ProposalID as proposal_id, 
+				Status as status
+        FROM tb_proposal
+        WHERE ProposalID = inProposalID;
+        
+	ELSEIF inStatus = 3 AND CurrentStatus = 2 THEN
+        UPDATE tb_proposal
+        SET Status = inStatus 
+        WHERE ProposalID = inProposalID;
+        
+		-- 輸出影響列數
+        SELECT row_count() INTO outAffectedRowNum;
+        
+        -- 印出結果
+        SELECT ProposalID as proposal_id, 
+				Status as status
+        FROM tb_proposal
+        WHERE ProposalID = inProposalID;
+    
+    ELSE -- 以上可能性都不是
+		SELECT 0 INTO outAffectedRowNum;
+    END IF;
+END
+
+//第七題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_GetHistorySponsorByMember`(
+	IN inMemberID int,
+    OUT outRowFound	int
+)
+BEGIN
+	SELECT tb_sponserrecord.MemberID as member_id,
+			tb_proposal.ProposalID as proposal_id, 
+            tb_proposal.ProposalTitle as proposal_title, 
+            tb_proposaloption.ProposalOptionTitle as proposal_option_title, 
+            tb_sponserrecord.Amount as amount,
+            tb_proposal.Status as status
+    FROM tb_sponserrecord 
+		INNER JOIN tb_proposaloption ON tb_sponserrecord.ProposalOptionID = tb_proposaloption.ProposalOptionID
+		INNER JOIN tb_proposal ON tb_proposaloption.ProposalID = tb_proposal.ProposalID
+    WHERE tb_sponserrecord.MemberID = inMemberID
+    AND tb_sponserrecord.IsDeleted = 0;  -- 該贊助紀錄尚未被使用者刪除
+    
+    -- 輸出總共找到的列數
+    SELECT found_rows() INTO outRowFound;
+END
+
+//第八題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_GetUnrepliedComments`(
+	IN inMemberID int,
+    OUT outRowFound	int
+)
+BEGIN
+	SELECT tb_proposalmember.MemberID as member_id,
+			tb_proposal.ProposalID as proposal_id, 
+            tb_proposal.ProposalTitle as proposal_title,
+            tb_comment.CommentID as comment_id,
+            tb_comment.MemberComment as member_comment,
+            tb_comment.CommentCreateTime as comment_time,
+            tb_comment.ProposerResponse as proposer_response
+    FROM tb_proposalmember 
+		INNER JOIN tb_proposal ON tb_proposalmember.ProposalID = tb_proposal.ProposalID
+		INNER JOIN tb_comment ON tb_proposal.ProposalID = tb_comment.ProposalID
+    WHERE tb_proposalmember.MemberID = inMemberID
+    AND tb_comment.ProposerResponse = ''
+    AND tb_comment.IsDeleted = 0;  -- 該贊助紀錄尚未被使用者刪除
+    
+    -- 輸出總共找到的列數
+    SELECT found_rows() INTO outRowFound;
+END
+
+//第九題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_GetProposalByCompletionRate`(
+	IN inRatio float,
+    OUT outRowFound	int
+)
+BEGIN	
+	SELECT * FROM
+		(SELECT ProposalID as proposal_id,
+				ProposalTitle as proposal_title,
+				AccumulatedAmount as proposal_amount,
+				Goal as goal,
+				-- 取小數點後兩位，不四捨五入
+                TRUNCATE((AccumulatedAmount / Goal), 2) as ratio
+		FROM tb_proposal
+		-- Status 2 或 3 即為募資中、已到期
+		WHERE Status!= 1
+		-- 還未超過30天
+		AND IsDeactivated = 0)temp
+	WHERE temp.ratio > inRatio
+	-- 依 ratio 大至小排列
+	ORDER BY temp.ratio DESC; 
+    
+    SELECT found_rows() INTO outRowFound;
+END
+
+//第十題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_CreateProposal`(
+    IN inMemberID int, 
+    IN inTitle varchar(120), 
+    IN inContent TEXT, 
+    IN inGoal int, 
+    IN inCategoryID int,
+    OUT outAffectedRowNum int,
+    OUT outMessage TEXT
+)
+BEGIN
+	-- 資料出錯時可以rollback
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+	BEGIN
+	ROLLBACK;
+	SELECT 'An error has occurred, operation rollbacked and the stored procedure was terminated' INTO outMessage;
+    SELECT 0 INTO outAffectedRowNum;
+	END;
+    
+    -- 確定沒有已存在的proposal標題或是內容
+    IF NOT EXISTS( 
+        SELECT ProposalID
+        FROM tb_proposal
+		WHERE ProposalTitle = inTitle OR Content = inContent
+	) THEN 
+		-- 開始創建
+		START TRANSACTION;
+			-- 創建proposal
+			INSERT INTO tb_proposal (CategoryID, ProposalTitle, Content, AccumulatedAmount, Goal, Status, ViewedClicks, ProposalCreateTime, IsPostponed, IsDeactivated)
+				VALUES(inCategoryID, inTitle, inContent, 0, inGoal, 1, 0, CURRENT_TIMESTAMP(), 0, 0);
+			-- 輸出前語法影響列數
+            SELECT row_count() INTO outAffectedRowNum;
+            -- 將創建的proposalID存入變數
+            SELECT LAST_INSERT_ID() INTO @var_tempproposalID;
+			-- 將創建者設為proposalmember，且因為是創建者，故IsMainProposer為1
+			INSERT INTO tb_proposalmember (ProposalID, MemberID, ProposalMemberCreateTime, IsMainProposer, IsDeleted)
+				VALUES(@var_tempproposalID, inMemberID, CURRENT_TIMESTAMP(), 1, 0);
+			-- 輸出前語法影響列數
+            SELECT outAffectedRowNum + row_count() INTO outAffectedRowNum;
+        -- 創建完成
+        COMMIT WORK;
+        -- 更改成功訊息
+		SELECT 'Create Proposal success' INTO outMessage;
+		-- 最終table輸出
+        SELECT tb_proposal.ProposalID as proposal_id,
+				tb_proposal.ProposalTitle as proposal_title,
+				tb_proposal.Content as proposal_content,
+				tb_proposal.AccumulatedAmount as amount,
+				tb_proposal.Goal as goal,
+				tb_proposal.Status as status,
+				tb_proposal.ViewedClicks as viewed_num,
+				tb_proposal.ProposalCreateTime as create_date,
+				tb_proposal.DueTime as due_date,
+				tb_category.CategoryTitle as category
+		FROM tb_proposal
+		INNER JOIN tb_category ON tb_proposal.CategoryID = tb_category.CategoryID
+		WHERE tb_proposal.ProposalID = @var_tempproposalID;
+	ELSE
+		SELECT 'The proposal already exist' INTO outMessage;
+        SELECT 0 INTO outAffectedRowNum;
+    END IF;
+
+END
+
+
+//第十一題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_GetRecommendedProposals`(
+	IN inMemberID int,
+    OUT outRowFound	int    
+)
+BEGIN
+	-- 若存在符合條件的proposal
+	IF EXISTS(
+		SELECT * FROM tb_proposal
+			WHERE Status = 2 -- 提案狀態必須是2
+			AND ProposalID NOT IN(
+				-- 為memberID不曾贊助過的提案
+				SELECT DISTINCT tb_proposaloption.ProposalID 
+				FROM tb_sponserrecord
+				INNER JOIN tb_proposaloption ON tb_sponserrecord.ProposalOptionID = tb_proposaloption.ProposalOptionID
+				WHERE tb_sponserrecord.MemberID = 3)
+			AND ProposalID NOT IN(
+				-- 推薦內容不可以是自己的提案
+				SELECT DISTINCT ProposalID 
+				FROM tb_proposalmember
+				WHERE MemberID = 3)
+			AND ProposalID IN(
+				-- 贊助同樣提案的人所贊助的提案
+				SELECT DISTINCT tb_proposaloption.ProposalID 
+					FROM tb_sponserrecord
+					INNER JOIN tb_proposaloption ON tb_sponserrecord.ProposalOptionID = tb_proposaloption.ProposalOptionID
+					WHERE tb_sponserrecord.MemberID IN(
+						-- 贊助同樣提案的人
+						SELECT DISTINCT tb_sponserrecord.MemberID
+						FROM tb_sponserrecord
+						INNER JOIN tb_proposaloption ON tb_sponserrecord.ProposalOptionID = tb_proposaloption.ProposalOptionID
+						WHERE tb_sponserrecord.MemberID != 3 
+						AND tb_proposaloption.ProposalID IN (
+							-- MemberID贊助過的提案
+							SELECT DISTINCT tb_proposaloption.ProposalID 
+							FROM tb_sponserrecord
+							INNER JOIN tb_proposaloption ON tb_sponserrecord.ProposalOptionID = tb_proposaloption.ProposalOptionID
+							WHERE tb_sponserrecord.MemberID = 3)))
+	)THEN 
+		SELECT ProposalID as proposal_id,
+				ProposalTitle as propoal_title,
+				Status as status,
+				ViewedClicks as viewed_num
+		-- 從符合條件的選取
+		FROM (SELECT * FROM tb_proposal
+				WHERE Status = 2 -- 提案狀態必須是2
+				AND ProposalID NOT IN(
+					-- 為memberID不曾贊助過的提案
+					SELECT DISTINCT tb_proposaloption.ProposalID 
+					FROM tb_sponserrecord
+					INNER JOIN tb_proposaloption ON tb_sponserrecord.ProposalOptionID = tb_proposaloption.ProposalOptionID
+					WHERE tb_sponserrecord.MemberID = 3)
+				AND ProposalID NOT IN(
+					-- 推薦內容不可以是自己的提案
+					SELECT DISTINCT ProposalID 
+					FROM tb_proposalmember
+					WHERE MemberID = 3)
+				AND ProposalID IN(
+					-- 贊助同樣提案的人所贊助的提案
+					SELECT DISTINCT tb_proposaloption.ProposalID 
+						FROM tb_sponserrecord
+						INNER JOIN tb_proposaloption ON tb_sponserrecord.ProposalOptionID = tb_proposaloption.ProposalOptionID
+						WHERE tb_sponserrecord.MemberID IN(
+							-- 贊助同樣提案的人
+							SELECT DISTINCT tb_sponserrecord.MemberID
+							FROM tb_sponserrecord
+							INNER JOIN tb_proposaloption ON tb_sponserrecord.ProposalOptionID = tb_proposaloption.ProposalOptionID
+							WHERE tb_sponserrecord.MemberID != 3 
+							AND tb_proposaloption.ProposalID IN (
+								-- MemberID贊助過的提案
+								SELECT DISTINCT tb_proposaloption.ProposalID 
+								FROM tb_sponserrecord
+								INNER JOIN tb_proposaloption ON tb_sponserrecord.ProposalOptionID = tb_proposaloption.ProposalOptionID
+								WHERE tb_sponserrecord.MemberID = 3))))temp
+		ORDER BY ViewedClicks DESC
+		LIMIT 5;
+	-- 沒有符合條件的proposal，則輸出推薦點閱率 (viewed_num) 最多的前五項提案
+	ELSE 
+		SELECT ProposalID as proposal_id,
+			ProposalTitle as propoal_title,
+			Status as status,
+			ViewedClicks as viewed_num
+		FROM tb_proposal
+        WHERE Status = 2
+		ORDER BY ViewedClicks DESC
+		LIMIT 5;
+	END IF;
+	
+    SELECT found_rows() INTO outRowFound;
+END
+
+//第十二題
+CREATE DEFINER=`root`@`localhost` PROCEDURE `sp_DeleteMember`(
+	IN inMemberID int,
+    OUT outAffectedRowNum int,
+    OUT outMessage TEXT
+)
+BEGIN
+	-- 資料出錯時可以rollback
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+	BEGIN
+	ROLLBACK;
+	SELECT 'An error has occurred, operation rollbacked and the stored procedure was terminated' INTO outMessage;
+    SELECT 0 INTO outAffectedRowNum;
+	END;
+    -- 確認帳號存在
+    IF EXISTS( 
+        SELECT MemberID
+        FROM tb_member
+		WHERE MemberID = inMemberID
+	) THEN 
+		-- 確認該帳號並非仍然屬於proposalmember之一
+		IF NOT EXISTS (
+			SELECT ProposalMemberID
+            FROM tb_proposalmember
+            WHERE MemberID = inMemberID
+            AND IsDeleted = 0
+		)THEN
+			-- 刪除帳號連帶刪除的各項紀錄如下(因為ER設計為CASCADE): Membercredential、Followingrecord、 SponsorRecord 、 Comment 、ProposalMember
+			-- 開始刪除
+            START TRANSACTION;
+                -- 刪除帳號
+                DELETE FROM tb_member 
+                WHERE MemberID = inMemberID;
+                SELECT row_count() INTO outAffectedRowNum;
+			-- 刪除成功
+			COMMIT WORK;
+			SELECT 'DELETE SUCCESS' INTO outMessage;
+		ELSE
+			SELECT 'DELETE FAILED: You are still a proposal member, thus, you cannot delete your account' INTO outMessage;
+			SELECT 0 INTO outAffectedRowNum;
+        END IF;
+	ELSE
+		SELECT 'DELETE FAILED: The member does not exist' INTO outMessage;
+		SELECT 0 INTO outAffectedRowNum;
+    END IF;
+END
+
+proin.non@protonmail.com
+
+1a4c96ddeda1e2bfc16abd7bd6f8a72dc416c10c824747cbe5b1f9cc20671c40
